@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifdef _WIN32
+#include "Windows.h"
+#include "processthreadsapi.h"
+#endif
+
 #include <set>
 #include <fmt/core.h>
 
@@ -98,8 +103,51 @@ Emulator::~Emulator() {
     Config::saveMainWindow(config_dir / "config.toml");
 }
 
+#ifdef _WIN32
+void ChooseCPUSet() {
+    std::vector<u8> storage(0x20 * 64);
+    ULONG size = 0;
+    GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(storage.data()),
+                               storage.size(), &size, nullptr, 0);
+    storage.resize(size);
+    u8* curr = storage.data();
+    const auto end = storage.data() + size;
+    std::vector<std::pair<DWORD, BYTE>> classes;
+    classes.reserve(64);
+    while (curr < end) {
+        const auto info = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(curr);
+        curr += info->Size;
+        classes.emplace_back(info->CpuSet.Id, info->CpuSet.EfficiencyClass);
+        LOG_CRITICAL(Debug, "Id {}, EfficiencyClass {}", info->CpuSet.Id,
+                     info->CpuSet.EfficiencyClass);
+    }
+
+    BYTE max_class = 0;
+    for (const auto& cl : classes) {
+        if (cl.second > max_class) {
+            max_class = cl.second;
+        }
+    }
+
+    std::vector<ULONG> set_ids;
+    set_ids.reserve(64);
+    for (const auto& cl : classes) {
+        if (cl.second == max_class) {
+            set_ids.push_back(cl.first);
+        }
+    }
+
+    SetProcessDefaultCpuSets(GetCurrentProcess(), set_ids.data(), set_ids.size());
+}
+#endif
+
 void Emulator::Run(const std::filesystem::path& file) {
     // Applications expect to be run from /app0 so mount the file's parent path as app0.
+
+#ifdef _WIN32
+    ChooseCPUSet();
+#endif
+
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
     const auto game_folder = file.parent_path();
     mnt->Mount(game_folder, "/app0");
