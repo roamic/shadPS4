@@ -268,6 +268,12 @@ endif()
 
 add_subdirectory(aacdec)
 
+if (NOT TARGET ap4)
+set(BUILD_APPS OFF)
+set(MSVC_FORCE_STATIC_C_RUNTIME OFF)
+add_subdirectory(bento4)
+endif()
+
 #nlohmann json 
 if (NOT TARGET nlohmann_json::nlohmann_json)
 set(JSON_BuildTests OFF CACHE INTERNAL "")

@@ -164,3 +164,6 @@
 [submodule "externals/zarchive"]
 	path = externals/zarchive
 	url = https://github.com/shadexternals/ZArchive.git
+[submodule "externals/bento4"]
+	path = externals/bento4
+	url = https://github.com/axiomatic-systems/Bento4.git

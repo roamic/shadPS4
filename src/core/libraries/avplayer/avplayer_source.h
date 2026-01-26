@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <string_view>
 #include <utility>
@@ -20,12 +21,15 @@
 #include "core/libraries/kernel/threads.h"
 
 struct AVCodecContext;
-struct AVFormatContext;
 struct AVFrame;
-struct AVIOContext;
 struct AVPacket;
 struct SwrContext;
 struct SwsContext;
+
+class AP4_ByteStream;
+class AP4_File;
+class AP4_Track;
+struct AP4_Packet;
 
 namespace Libraries::AvPlayer {
 
@@ -46,17 +50,18 @@ public:
                 bool is_texture) noexcept
         : m_memory_replacement(memory_replacement),
           m_data(is_texture ? AllocateTexture(memory_replacement, align, size)
-                            : Allocate(memory_replacement, align, size)),
+                            : Allocate(memory_replacement, align, size),
+                 size),
           m_is_texture(is_texture) {
-        ASSERT_MSG(m_data, "Could not allocate frame buffer.");
+        ASSERT_MSG(m_data.data(), "Could not allocate frame buffer.");
     }
 
     ~GuestBuffer() {
-        if (m_data != nullptr) {
+        if (!m_data.empty()) {
             if (m_is_texture) {
-                DeallocateTexture(m_memory_replacement, m_data);
+                DeallocateTexture(m_memory_replacement, m_data.data());
             } else {
-                Deallocate(m_memory_replacement, m_data);
+                Deallocate(m_memory_replacement, m_data.data());
             }
             m_data = {};
         }
@@ -68,7 +73,7 @@ public:
     GuestBuffer(GuestBuffer&& r) noexcept
         : m_memory_replacement(r.m_memory_replacement), m_data(r.m_data),
           m_is_texture(r.m_is_texture) {
-        r.m_data = nullptr;
+        r.m_data = {};
     };
 
     GuestBuffer& operator=(GuestBuffer&& r) noexcept {
@@ -76,7 +81,7 @@ public:
         return *this;
     }
 
-    u8* GetBuffer() const noexcept {
+    std::span<u8> GetBuffer() const noexcept {
         return m_data;
     }
 
@@ -101,7 +106,7 @@ private:
     }
 
     const AvPlayerMemAllocator& m_memory_replacement;
-    u8* m_data = nullptr;
+    std::span<u8> m_data{};
     bool m_is_texture = false;
 };
 
@@ -171,14 +176,12 @@ private:
     static void ReleaseAVCodecContext(AVCodecContext* context);
     static void ReleaseSWRContext(SwrContext* context);
     static void ReleaseSWSContext(SwsContext* context);
-    static void ReleaseAVFormatContext(AVFormatContext* context);
 
     using AVPacketPtr = std::unique_ptr<AVPacket, decltype(&ReleaseAVPacket)>;
     using AVFramePtr = std::unique_ptr<AVFrame, decltype(&ReleaseAVFrame)>;
     using AVCodecContextPtr = std::unique_ptr<AVCodecContext, decltype(&ReleaseAVCodecContext)>;
     using SWRContextPtr = std::unique_ptr<SwrContext, decltype(&ReleaseSWRContext)>;
     using SWSContextPtr = std::unique_ptr<SwsContext, decltype(&ReleaseSWSContext)>;
-    using AVFormatContextPtr = std::unique_ptr<AVFormatContext, decltype(&ReleaseAVFormatContext)>;
 
     void DemuxerThread(std::stop_token stop);
     void VideoDecoderThread(std::stop_token stop);
@@ -186,10 +189,9 @@ private:
 
     bool HasRunningThreads() const;
 
-    AVFramePtr ConvertAudioFrame(const AVFrame& frame);
     AVFramePtr ConvertVideoFrame(const AVFrame& frame);
 
-    Frame PrepareAudioFrame(GuestBuffer buffer, const AVFrame& frame);
+    Frame PrepareAudioFrame(GuestBuffer buffer, const AP4_Packet& packet);
     Frame PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame);
 
     AvPlayerStateCallback& m_state;
@@ -209,13 +211,14 @@ private:
     std::atomic_bool m_is_paused = false;
     std::atomic_bool m_is_eof = false;
 
-    std::unique_ptr<IDataStreamer> m_up_data_streamer;
+    std::unique_ptr<AP4_ByteStream> m_up_data_streamer;
+    std::unique_ptr<AP4_File> m_ap4_file;
 
     AvPlayerQueue<GuestBuffer> m_audio_buffers;
     AvPlayerQueue<GuestBuffer> m_video_buffers;
 
-    AvPlayerQueue<AVPacketPtr> m_audio_packets;
-    AvPlayerQueue<AVPacketPtr> m_video_packets;
+    AvPlayerQueue<std::unique_ptr<AP4_Packet>> m_audio_packets;
+    AvPlayerQueue<std::unique_ptr<AP4_Packet>> m_video_packets;
 
     AvPlayerQueue<Frame> m_audio_frames;
     AvPlayerQueue<Frame> m_video_frames;
@@ -223,8 +226,12 @@ private:
     std::optional<Frame> m_current_video_frame;
     std::optional<Frame> m_current_audio_frame;
 
-    std::optional<s32> m_video_stream_index{};
-    std::optional<s32> m_audio_stream_index{};
+    u32 m_video_track_index;
+    u32 m_audio_track_index;
+    AP4_Track* m_p_video_track{};
+    AP4_Track* m_p_audio_track{};
+    u32 m_video_sample_index{};
+    u32 m_audio_sample_index{};
 
     EventCV m_audio_packets_cv{};
     EventCV m_audio_frames_cv{};
@@ -239,11 +246,10 @@ private:
     Kernel::Thread m_video_decoder_thread{};
     Kernel::Thread m_audio_decoder_thread{};
 
-    AVFormatContextPtr m_avformat_context{nullptr, &ReleaseAVFormatContext};
     AVCodecContextPtr m_video_codec_context{nullptr, &ReleaseAVCodecContext};
-    AVCodecContextPtr m_audio_codec_context{nullptr, &ReleaseAVCodecContext};
-    SWRContextPtr m_swr_context{nullptr, &ReleaseSWRContext};
     SWSContextPtr m_sws_context{nullptr, &ReleaseSWSContext};
+
+    std::unique_ptr<AjmAacDecoder> m_audio_decoder;
 
     std::optional<u64> m_last_audio_ts{};
     std::optional<std::chrono::high_resolution_clock::time_point> m_last_data_time{};

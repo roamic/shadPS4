@@ -140,8 +140,6 @@ bool AvPlayerState::AddSource(std::string_view path, AvPlayerSourceType source_t
             return false;
         }
 
-        s32 sdk_ver{};
-        Libraries::Kernel::sceKernelGetCompiledSdkVersion(&sdk_ver);
         m_up_source = std::make_unique<AvPlayerSource>(*this);
         if (!m_up_source->Init(m_init_data, path)) {
             SetState(AvState::Error);

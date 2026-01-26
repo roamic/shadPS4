@@ -5,6 +5,7 @@
 #include "common/singleton.h"
 #include "common/thread.h"
 #include "core/file_sys/fs.h"
+#include "core/libraries/avplayer/avplayer_ajm_wrapper.h"
 #include "core/libraries/avplayer/avplayer_error.h"
 #include "core/libraries/avplayer/avplayer_file_streamer.h"
 #include "core/libraries/avplayer/avplayer_handle_streamer.h"
@@ -13,6 +14,10 @@
 #include "core/memory.h"
 
 #include <magic_enum/magic_enum.hpp>
+
+#include <Ap4.h>
+#include <Ap4BitStream.h>
+#include <Ap4Mp4AudioInfo.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -25,18 +30,83 @@ extern "C" {
 
 #include "common/support/avdec.h"
 
+struct AP4_Packet {
+    AP4_Sample sample;
+    AP4_DataBuffer data;
+    u32 track_index = 0;
+    u32 time_scale = 0;
+    bool is_last = false;
+};
+
 namespace Libraries::AvPlayer {
 
-static AvPlayerStreamType CodecTypeToStreamType(AVMediaType codec_type) {
-    switch (codec_type) {
-    case AVMediaType::AVMEDIA_TYPE_VIDEO:
+constexpr u32 max_video_packets = 8;
+constexpr u32 max_audio_packets = 8;
+
+AvPlayerSource::AvPlayerSource(AvPlayerStateCallback& state) : m_state(state) {}
+
+AvPlayerSource::~AvPlayerSource() {
+    Stop();
+}
+
+bool AvPlayerSource::Init(const AvPlayerInitData& init_data, std::string_view path) {
+    m_memory_replacement = init_data.memory_replacement;
+    m_max_num_video_framebuffers =
+        std::min(std::max(2, init_data.num_output_video_framebuffers), 16);
+
+    if (init_data.file_replacement.open != nullptr) {
+        auto up_data_streamer = std::make_unique<AP4_FileStreamer>(init_data.file_replacement);
+        if (!up_data_streamer->Init(path)) {
+            return false;
+        }
+        m_up_data_streamer = std::move(up_data_streamer);
+    } else {
+        const auto mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
+        const auto filepath = mnt->GetHostPath(path).u8string();
+        AP4_ByteStream* stream = nullptr;
+        const auto result =
+            AP4_FileByteStream::Create(reinterpret_cast<const char*>(filepath.c_str()),
+                                       AP4_FileByteStream::Mode::STREAM_MODE_READ, stream);
+        if (AP4_FAILED(result)) {
+            return false;
+        }
+        m_up_data_streamer.reset(stream);
+    }
+    m_ap4_file = std::make_unique<AP4_File>(*m_up_data_streamer, true);
+    return true;
+}
+
+bool AvPlayerSource::FindStreamInfo() {
+    auto* movie = m_ap4_file->GetMovie();
+    if (movie == nullptr) {
+        LOG_ERROR(Lib_AvPlayer, "Could not find stream info. NULL movie.");
+        return false;
+    }
+    if (movie->GetTracks().ItemCount() == 0) {
+        return false;
+    }
+    return true;
+}
+
+s32 AvPlayerSource::GetStreamCount() {
+    auto* movie = m_ap4_file->GetMovie();
+    if (movie == nullptr) {
+        LOG_ERROR(Lib_AvPlayer, "Could not get stream count. NULL movie.");
+        return -1;
+    }
+    return movie->GetTracks().ItemCount();
+}
+
+static AvPlayerStreamType TrackTypeToStreamType(AP4_Track::Type track_type) {
+    switch (track_type) {
+    case AP4_Track::Type::TYPE_VIDEO:
         return AvPlayerStreamType::Video;
-    case AVMediaType::AVMEDIA_TYPE_AUDIO:
+    case AP4_Track::Type::TYPE_AUDIO:
         return AvPlayerStreamType::Audio;
-    case AVMediaType::AVMEDIA_TYPE_SUBTITLE:
+    case AP4_Track::Type::TYPE_SUBTITLES:
         return AvPlayerStreamType::TimedText;
     default:
-        LOG_ERROR(Lib_AvPlayer, "Unexpected AVMediaType {}", magic_enum::enum_name(codec_type));
+        LOG_ERROR(Lib_AvPlayer, "Unexpected AVMediaType {}", magic_enum::enum_name(track_type));
         return AvPlayerStreamType::Unknown;
     }
 }
@@ -156,48 +226,73 @@ static u64 StreamDurationMillis(const AVFormatContext& context, const AVStream& 
 
 AvPlayerStreamInfo AvPlayerSource::CreateStreamInfo(u32 stream_index) {
     AvPlayerStreamInfo info = {};
-    const auto p_stream = m_avformat_context->streams[stream_index];
-    info.type = CodecTypeToStreamType(p_stream->codecpar->codec_type);
-    info.start_time = 0; // start_time is currently unused and defaults to 0.
-    info.duration = StreamDurationMillis(*m_avformat_context, *p_stream);
-    const auto p_lang_node = av_dict_get(p_stream->metadata, "language", nullptr, 0);
-    if (p_lang_node != nullptr) {
-        LOG_INFO(Lib_AvPlayer, "Stream {} language = {}", stream_index, p_lang_node->value);
+    // const auto p_stream = m_avformat_context->streams[stream_index];
+    // info.type = CodecTypeToStreamType(p_stream->codecpar->codec_type);
+    // info.start_time = 0; // start_time is currently unused and defaults to 0.
+    // info.duration = StreamDurationMillis(*m_avformat_context, *p_stream);
+    if (m_ap4_file == nullptr || stream_index >= GetStreamCount()) {
+        LOG_ERROR(Lib_AvPlayer, "Could not get stream {} info.", stream_index);
+        return false;
+    }
+    AP4_Track* p_track = nullptr;
+    if (AP4_FAILED(m_ap4_file->GetMovie()->GetTracks().Get(stream_index, p_track))) {
+        return false;
+    }
+    if (p_track == nullptr) {
+        LOG_ERROR(Lib_AvPlayer, "Could not get stream {} info. NULL track.", stream_index);
+        return false;
+    };
+    info.type = TrackTypeToStreamType(p_track->GetType());
+    AP4_Sample sample;
+    if (AP4_FAILED(p_track->GetSample(0, sample))) {
+        return false;
+    }
+    info.start_time = sample.GetDts();
+    info.duration = p_track->GetDurationMs();
+    auto* language = p_track->GetTrackLanguage();
+    if (language != nullptr) {
+        LOG_INFO(Lib_AvPlayer, "Stream {} language = {}", stream_index, language);
     } else {
         LOG_WARNING(Lib_AvPlayer, "Stream {} language is unknown", stream_index);
     }
     switch (info.type) {
     case AvPlayerStreamType::Video: {
         LOG_INFO(Lib_AvPlayer, "Stream {} is a video stream.", stream_index);
-        info.details.video.aspect_ratio =
-            f32(p_stream->codecpar->width) / p_stream->codecpar->height;
-        const auto width = Common::AlignUp<u32>(p_stream->codecpar->width, 16);
-        const auto height = Common::AlignUp<u32>(p_stream->codecpar->height, 16);
+        info.details.video.aspect_ratio = f32(p_track->GetWidth()) / p_track->GetHeight();
+        auto width = Common::AlignUp<u32>(p_track->GetWidth() / 65536, 16);
+        auto height = Common::AlignUp<u32>(p_track->GetHeight() / 65536, 16);
         info.details.video.width = width;
         info.details.video.height = height;
-        if (p_lang_node != nullptr) {
-            std::memcpy(info.details.video.language_code, p_lang_node->value,
-                        std::min(strlen(p_lang_node->value), size_t(3)));
+        if (language != nullptr) {
+            std::memcpy(info.details.video.language_code, language,
+                        std::min<size_t>(strlen(language), 3));
         }
         break;
     }
     case AvPlayerStreamType::Audio: {
+        auto* desc = AP4_DYNAMIC_CAST(AP4_MpegSampleDescription, p_track->GetSampleDescription(0));
+        const auto& dec_info = desc->GetDecoderInfo();
+        AP4_Mp4AudioDecoderConfig dec_config;
+        auto result = dec_config.Parse(dec_info.GetData(), dec_info.GetDataSize());
+        if (AP4_FAILED(result)) {
+            return false;
+        }
         LOG_INFO(Lib_AvPlayer, "Stream {} is an audio stream.", stream_index);
-        info.details.audio.channel_count = p_stream->codecpar->ch_layout.nb_channels;
-        info.details.audio.sample_rate = p_stream->codecpar->sample_rate;
+        info.details.audio.channel_count = dec_config.m_ChannelCount;
+        info.details.audio.sample_rate = dec_config.m_SamplingFrequency;
         info.details.audio.size = 0; // sceAvPlayerGetStreamInfo() is expected to set this to 0
-        if (p_lang_node != nullptr) {
-            std::memcpy(info.details.audio.language_code, p_lang_node->value,
-                        std::min(strlen(p_lang_node->value), size_t(3)));
+        if (language != nullptr) {
+            std::memcpy(info.details.audio.language_code, language,
+                        std::min<size_t>(strlen(language), 3));
         }
         break;
     }
     case AvPlayerStreamType::TimedText: {
         info.details.subs.font_size = 12;
         info.details.subs.text_size = 12;
-        if (p_lang_node != nullptr) {
-            std::memcpy(info.details.subs.language_code, p_lang_node->value,
-                        std::min(strlen(p_lang_node->value), size_t(3)));
+        if (language != nullptr) {
+            std::memcpy(info.details.subs.language_code, language,
+                        std::min<size_t>(strlen(language), 3));
         }
         break;
     }
@@ -219,25 +314,30 @@ bool AvPlayerSource::GetStreamInfo(u32 stream_index, AvPlayerStreamInfo& info) {
 }
 
 bool AvPlayerSource::EnableStream(u32 stream_index) {
-    if (m_avformat_context == nullptr || stream_index >= m_streams.size()) {
+    if (m_ap4_file == nullptr || stream_index >= m_streams.size()) {
         return false;
     }
     stream_index = m_streams[stream_index].ffmpeg_index;
-    const auto stream = m_avformat_context->streams[stream_index];
-    switch (stream->codecpar->codec_type) {
-    case AVMediaType::AVMEDIA_TYPE_VIDEO: {
-        m_video_stream_index = stream_index;
+    AP4_Track* p_track = nullptr;
+    if (AP4_FAILED(m_ap4_file->GetMovie()->GetTracks().Get(stream_index, p_track))) {
+        return false;
+    }
+    switch (p_track->GetType()) {
+    case AP4_Track::Type::TYPE_VIDEO: {
+        m_p_video_track = p_track;
+        m_video_track_index = stream_index;
         LOG_INFO(Lib_AvPlayer, "Video stream {} enabled", stream_index);
         break;
     }
-    case AVMediaType::AVMEDIA_TYPE_AUDIO: {
-        m_audio_stream_index = stream_index;
+    case AP4_Track::Type::TYPE_AUDIO: {
+        m_p_audio_track = p_track;
+        m_audio_track_index = 1; // stream_index;
         LOG_INFO(Lib_AvPlayer, "Audio stream {} enabled", stream_index);
         break;
     }
     default:
         LOG_WARNING(Lib_AvPlayer, "Unknown stream type {} for stream {}",
-                    magic_enum::enum_name(stream->codecpar->codec_type), stream_index);
+                    magic_enum::enum_name(p_track->GetType()), stream_index);
         break;
     }
     return true;
@@ -251,32 +351,78 @@ std::optional<bool> AvPlayerSource::HasFrames(u32 num_frames) {
     return m_video_packets.Size() > num_frames || m_is_eof;
 }
 
+AVCodecID SampleTypeToCodecID(AP4_SampleDescription::Type sample_type) {
+    switch (sample_type) {
+    case AP4_SampleDescription::TYPE_AVC:
+        return AV_CODEC_ID_H264;
+    case AP4_SampleDescription::TYPE_HEVC:
+        return AV_CODEC_ID_HEVC;
+    case AP4_SampleDescription::TYPE_MPEG:
+        return AV_CODEC_ID_AAC;
+    default:
+        UNREACHABLE_MSG("Unknown codec type: {}", magic_enum::enum_name(sample_type));
+    }
+}
+
 bool AvPlayerSource::Start() {
     std::unique_lock lock(m_state_mutex);
 
-    if (!m_video_stream_index && !m_audio_stream_index) {
+    if (m_p_video_track == nullptr && m_p_audio_track == nullptr) {
         LOG_ERROR(Lib_AvPlayer, "Could not start playback. No streams.");
         return false;
     }
-    if (m_video_stream_index) {
-        const auto stream_index = m_streams[m_video_stream_index.value()].ffmpeg_index;
-        const auto stream = m_avformat_context->streams[stream_index];
-        avformat_seek_file(m_avformat_context.get(), m_video_stream_index.value(), 0, 0,
-                           stream->duration, 0);
-        const auto decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+    if (m_p_video_track != nullptr) {
+        auto* sdesc = m_p_video_track->GetSampleDescription(0);
+        auto* vsdesc = AP4_DYNAMIC_CAST(AP4_VideoSampleDescription, sdesc);
+        auto codec_id = SampleTypeToCodecID(sdesc->GetType());
+        const auto decoder = avcodec_find_decoder(codec_id);
         if (decoder == nullptr) {
             return false;
         }
         m_video_codec_context =
             AVCodecContextPtr(avcodec_alloc_context3(decoder), &ReleaseAVCodecContext);
-        if (avcodec_parameters_to_context(m_video_codec_context.get(), stream->codecpar) < 0) {
-            LOG_ERROR(Lib_AvPlayer, "Could not copy stream {} avcodec parameters to context.",
-                      m_video_stream_index.value());
+        u32 width = vsdesc->GetWidth();
+        u32 height = vsdesc->GetHeight();
+        AP4_String codec_tag{};
+        sdesc->GetCodecString(codec_tag);
+        AVCodecParameters params{};
+        params.codec_type = AVMEDIA_TYPE_VIDEO;
+        params.codec_id = codec_id;
+        params.codec_tag = *reinterpret_cast<const u32*>(codec_tag.GetChars());
+        if (sdesc->GetType() == AP4_SampleDescription::TYPE_AVC) {
+            auto* avc_sample_desc = AP4_DYNAMIC_CAST(AP4_AvcSampleDescription, sdesc);
+            params.profile = avc_sample_desc->GetProfile();
+            params.level = avc_sample_desc->GetLevel();
+            if (sdesc->GetFormat() != AP4_SAMPLE_FORMAT_AVC3 &&
+                sdesc->GetFormat() != AP4_SAMPLE_FORMAT_AVC4 &&
+                sdesc->GetFormat() != AP4_SAMPLE_FORMAT_DVAV) {
+                auto* avcsdesc = AP4_DYNAMIC_CAST(AP4_AvcSampleDescription, sdesc);
+                auto* atom = AP4_DYNAMIC_CAST(AP4_AvccAtom,
+                                              avcsdesc->GetDetails().GetChild(AP4_ATOM_TYPE_AVCC));
+                auto& bytes = atom->GetRawBytes();
+                params.extradata_size = bytes.GetBufferSize();
+                params.extradata = reinterpret_cast<u8*>(av_malloc(params.extradata_size));
+                std::memcpy(params.extradata, bytes.GetData(), params.extradata_size);
+            }
+        } else if (sdesc->GetType() == AP4_SampleDescription::TYPE_HEVC) {
+            auto* avc_sample_desc = AP4_DYNAMIC_CAST(AP4_HevcSampleDescription, sdesc);
+            params.profile = avc_sample_desc->GetGeneralProfile();
+            params.level = avc_sample_desc->GetGeneralLevel();
+        }
+        params.format = AV_SAMPLE_FMT_NONE;
+        // params.bit_rate;
+        // params.bits_per_coded_sample;
+        // params.bits_per_raw_sample;
+        params.width = width;
+        params.height = height;
+        // params.sample_aspect_ratio;
+        // params.framerate;
+        if (avcodec_parameters_to_context(m_video_codec_context.get(), &params) < 0) {
+            LOG_ERROR(Lib_AvPlayer, "Could not set video stream avcodec parameters.");
             return false;
         }
         if (avcodec_open2(m_video_codec_context.get(), decoder, nullptr) < 0) {
-            LOG_ERROR(Lib_AvPlayer, "Could not open avcodec for video stream {}.",
-                      m_video_stream_index.value());
+            LOG_ERROR(Lib_AvPlayer, "Could not open avcodec for video stream.");
             return false;
         }
         const auto pitch = Common::AlignUp<u32>(m_video_codec_context->width, 64);
@@ -286,32 +432,28 @@ bool AvPlayerSource::Start() {
             m_video_buffers.Push(GuestBuffer(m_memory_replacement, 0x100, size, true));
         }
     }
-    if (m_audio_stream_index) {
-        const auto stream_index = m_streams[m_audio_stream_index.value()].ffmpeg_index;
-        const auto stream = m_avformat_context->streams[stream_index];
-        avformat_seek_file(m_avformat_context.get(), m_audio_stream_index.value(), 0, 0,
-                           stream->duration, 0);
-        const auto decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+    if (m_p_audio_track != nullptr) {
+        auto* sample_desc = m_p_audio_track->GetSampleDescription(0);
+        auto* mpeg_sample_desc = AP4_DYNAMIC_CAST(AP4_MpegSampleDescription, sample_desc);
+        const auto& dec_info = mpeg_sample_desc->GetDecoderInfo();
+        AP4_Mp4AudioDecoderConfig dec_config;
+        auto result = dec_config.Parse(dec_info.GetData(), dec_info.GetDataSize());
+        if (AP4_FAILED(result)) {
+            return false;
+        }
+        auto codec_id = SampleTypeToCodecID(sample_desc->GetType());
+        const auto decoder = avcodec_find_decoder(codec_id);
         if (decoder == nullptr) {
             return false;
         }
-        m_audio_codec_context =
-            AVCodecContextPtr(avcodec_alloc_context3(decoder), &ReleaseAVCodecContext);
-        if (avcodec_parameters_to_context(m_audio_codec_context.get(), stream->codecpar) < 0) {
-            LOG_ERROR(Lib_AvPlayer, "Could not copy stream {} avcodec parameters to context.",
-                      m_audio_stream_index.value());
-            return false;
-        }
-        if (avcodec_open2(m_audio_codec_context.get(), decoder, nullptr) < 0) {
-            LOG_ERROR(Lib_AvPlayer, "Could not open avcodec for audio stream {}.",
-                      m_audio_stream_index.value());
-            return false;
-        }
-        constexpr u8 max_channels = 8;
-        constexpr size_t max_sample_size = sizeof(s32);
-        const auto size = max_channels * max_sample_size * 1024;
-        for (u64 index = 0; index < (m_max_num_video_framebuffers * 2); ++index) {
-            m_audio_buffers.Push(GuestBuffer(m_memory_replacement, 0x10, size, false));
+        AP4_String codec_tag{};
+        sample_desc->GetCodecString(codec_tag);
+        m_audio_decoder = std::make_unique<AjmAacDecoder>(context_id, dec_config.m_ChannelCount);
+        m_audio_decoder->Init(dec_config.m_SamplingFrequencyIndex);
+
+        const auto size = dec_config.m_ChannelCount * sizeof(u16) * 1024;
+        for (u64 index = 0; index < max_audio_packets; ++index) {
+            m_audio_buffers.Push(GuestBuffer(m_memory_replacement, 1, size, false));
         }
     }
     m_demuxer_thread.Run([this](std::stop_token stop) { this->DemuxerThread(stop); });
@@ -327,10 +469,6 @@ bool AvPlayerSource::Stop() {
     if (!HasRunningThreads()) {
         LOG_WARNING(Lib_AvPlayer, "Could not stop playback: already stopped.");
         return false;
-    }
-
-    if (m_up_data_streamer) {
-        m_up_data_streamer->Reset();
     }
 
     m_video_decoder_thread.Stop();
@@ -395,8 +533,17 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
     const auto current_time = CurrentTime();
     const auto& new_frame = m_video_frames.Front();
     if (m_state.GetSyncMode() == AvPlayerAvSyncMode::Default) {
-        if (new_frame.info.timestamp > current_time) {
-            return false;
+        if (m_p_audio_track != nullptr && m_audio_decoder_thread.Joinable()) {
+            // Audio is available, sync video with it.
+            if (new_frame.info.timestamp > m_last_audio_ts.value_or(0)) {
+                return false;
+            }
+        } else {
+            // Sync with the internal timer since audio is not available
+            const auto current_time = CurrentTime();
+            if (0 < current_time && current_time < new_frame.info.timestamp) {
+                return false;
+            }
         }
     }
 
@@ -547,66 +694,72 @@ void AvPlayerSource::ReleaseSWSContext(SwsContext* context) {
     }
 }
 
-void AvPlayerSource::ReleaseAVFormatContext(AVFormatContext* context) {
-    if (context != nullptr) {
-        avformat_close_input(&context);
-    }
-}
-
 void AvPlayerSource::DemuxerThread(std::stop_token stop) {
     using namespace std::chrono;
     Common::SetCurrentThreadName("shadPS4:AvDemuxer");
 
-    if (!m_audio_stream_index.has_value() && !m_video_stream_index.has_value()) {
+    if (m_p_video_track == nullptr && m_p_audio_track == nullptr) {
         LOG_WARNING(Lib_AvPlayer, "Could not start DEMUXER thread. No streams enabled.");
         return;
     }
     LOG_INFO(Lib_AvPlayer, "Demuxer Thread started");
 
+    bool video_eos = m_p_video_track == nullptr;
+    bool audio_eos = m_p_audio_track == nullptr;
+
     while (!stop.stop_requested()) {
-        if (m_video_packets.Size() > 30 &&
-            (!m_audio_stream_index.has_value() || m_audio_packets.Size() > 8)) {
+        if (m_video_packets.Size() >= max_video_packets &&
+            (m_p_audio_track == nullptr || m_audio_packets.Size() >= max_audio_packets)) {
             std::this_thread::sleep_for(milliseconds(5));
             continue;
         }
-        AVPacketPtr up_packet(av_packet_alloc(), &ReleaseAVPacket);
-        const auto res = av_read_frame(m_avformat_context.get(), up_packet.get());
-        if (res < 0) {
-            if (res == AVERROR_EOF) {
+        if (!video_eos && m_p_video_track != nullptr &&
+            m_video_packets.Size() < max_video_packets) {
+            auto up_packet = std::make_unique<AP4_Packet>();
+            auto result = m_p_video_track->ReadSample(m_video_sample_index++, up_packet->sample,
+                                                      up_packet->data);
+            if (result == AP4_ERROR_OUT_OF_RANGE) {
+                // up_packet->is_last = true;
                 if (m_is_looping) {
-                    LOG_INFO(Lib_AvPlayer, "EOF reached in demuxer. Looping the source...");
-                    m_state.OnWarning(ORBIS_AVPLAYER_ERROR_WAR_LOOPING_BACK);
-                    avio_seek(m_avformat_context->pb, 0, SEEK_SET);
-                    if (m_video_stream_index.has_value()) {
-                        const auto index = m_streams[m_video_stream_index.value()].ffmpeg_index;
-                        const auto stream = m_avformat_context->streams[index];
-                        avformat_seek_file(m_avformat_context.get(), index, 0, 0, stream->duration,
-                                           0);
-                    }
-                    if (m_audio_stream_index.has_value()) {
-                        const auto index = m_streams[m_audio_stream_index.value()].ffmpeg_index;
-                        const auto stream = m_avformat_context->streams[index];
-                        avformat_seek_file(m_avformat_context.get(), index, 0, 0, stream->duration,
-                                           0);
-                    }
-                    continue;
+                    m_video_sample_index = 0;
                 } else {
-                    LOG_INFO(Lib_AvPlayer, "EOF reached in demuxer. Exiting.");
-                    break;
+                    video_eos = true;
                 }
+            } else if (AP4_FAILED(result)) {
+                LOG_ERROR(Lib_AvPlayer, "Error reading sample from video stream: {}", result);
+                break;
             } else {
-                LOG_ERROR(Lib_AvPlayer, "Could not read AV frame: error = {}", res);
-                m_state.OnError();
-                return;
+                up_packet->track_index = m_video_track_index;
+                up_packet->time_scale = m_p_video_track->GetMovieTimeScale();
+                m_video_packets.Push(std::move(up_packet));
+                m_video_packets_cv.Notify();
             }
-            break;
         }
-        if (up_packet->stream_index == m_video_stream_index) {
-            m_video_packets.Push(std::move(up_packet));
-            m_video_packets_cv.Notify();
-        } else if (up_packet->stream_index == m_audio_stream_index) {
-            m_audio_packets.Push(std::move(up_packet));
-            m_audio_packets_cv.Notify();
+        if (!audio_eos && m_p_audio_track != nullptr &&
+            m_audio_packets.Size() < max_audio_packets) {
+            auto up_packet = std::make_unique<AP4_Packet>();
+            auto result = m_p_audio_track->ReadSample(m_audio_sample_index++, up_packet->sample,
+                                                      up_packet->data);
+            if (result == AP4_ERROR_OUT_OF_RANGE) {
+                up_packet->is_last = true;
+                if (m_is_looping) {
+                    m_audio_sample_index = 0;
+                } else {
+                    audio_eos = true;
+                }
+            } else if (AP4_FAILED(result)) {
+                LOG_ERROR(Lib_AvPlayer, "Error reading sample from audio stream: {}", result);
+                break;
+            } else {
+                up_packet->track_index = m_audio_track_index;
+                up_packet->time_scale = m_p_audio_track->GetMovieTimeScale();
+                m_audio_packets.Push(std::move(up_packet));
+                m_audio_packets_cv.Notify();
+            }
+        }
+        if (video_eos && audio_eos) {
+            LOG_INFO(Lib_AvPlayer, "EOF reached in demuxer.");
+            break;
         }
     }
 
@@ -701,8 +854,8 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
                     {
                         .video =
                             {
-                                .width = width,
-                                .height = height,
+                                .width = u32(frame.width),
+                                .height = u32(frame.height),
                                 .aspect_ratio = (float)av_q2d(frame.sample_aspect_ratio),
                                 .crop_left_offset = u32(frame.crop_left),
                                 .crop_right_offset = u32(frame.crop_right + (pitch - frame.width)),
@@ -733,7 +886,17 @@ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
             continue;
         }
 
-        auto res = avcodec_send_packet(m_video_codec_context.get(), packet->get());
+        AVPacket av_packet{};
+        av_packet.pts = (*packet)->sample.GetCts();
+        av_packet.dts = (*packet)->sample.GetDts();
+        av_packet.data = const_cast<uint8_t*>((*packet)->data.GetData());
+        av_packet.size = (*packet)->data.GetDataSize();
+        av_packet.stream_index = (*packet)->track_index;
+        av_packet.flags = (*packet)->sample.IsSync() ? AV_PKT_FLAG_KEY : 0;
+        av_packet.duration = (*packet)->sample.GetDuration();
+        av_packet.pos = (*packet)->sample.GetOffset();
+        av_packet.time_base = {1, s32((*packet)->time_scale)};
+        auto res = avcodec_send_packet(m_video_codec_context.get(), &av_packet);
         if (res < 0 && res != AVERROR(EAGAIN)) {
             m_state.OnError();
             LOG_ERROR(Lib_AvPlayer, "Could not send packet to the video codec. Error = {}",
@@ -783,50 +946,17 @@ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
     m_video_decoder_thread.Join();
 }
 
-AvPlayerSource::AVFramePtr AvPlayerSource::ConvertAudioFrame(const AVFrame& frame) {
-    auto pcm16_frame = AVFramePtr{av_frame_alloc(), &ReleaseAVFrame};
-    pcm16_frame->best_effort_timestamp = frame.best_effort_timestamp;
-    pcm16_frame->pts = frame.pts;
-    pcm16_frame->pkt_dts = frame.pkt_dts < 0 ? 0 : frame.pkt_dts;
-    pcm16_frame->format = AV_SAMPLE_FMT_S16;
-    pcm16_frame->ch_layout = frame.ch_layout;
-    pcm16_frame->sample_rate = frame.sample_rate;
+Frame AvPlayerSource::PrepareAudioFrame(GuestBuffer buffer, const AP4_Packet& packet) {
+    const auto den = m_p_audio_track->GetMovieTimeScale();
+    const auto pkt_dts = packet.sample.GetDts() * 1000;
+    const auto timestamp = den > 1 ? pkt_dts / den : pkt_dts;
 
-    if (m_swr_context == nullptr) {
-        SwrContext* swr_context = nullptr;
-        AVChannelLayout in_ch_layout = frame.ch_layout;
-        AVChannelLayout out_ch_layout = frame.ch_layout;
-        swr_alloc_set_opts2(&swr_context, &out_ch_layout, AV_SAMPLE_FMT_S16, frame.sample_rate,
-                            &in_ch_layout, AVSampleFormat(frame.format), frame.sample_rate, 0,
-                            nullptr);
-        m_swr_context = SWRContextPtr(swr_context, &ReleaseSWRContext);
-        swr_init(m_swr_context.get());
-    }
-    const auto res = swr_convert_frame(m_swr_context.get(), pcm16_frame.get(), &frame);
-    if (res < 0) {
-        LOG_ERROR(Lib_AvPlayer, "Could not convert to NV12: {}", av_err2str(res));
-        return AVFramePtr{nullptr, &ReleaseAVFrame};
-    }
-    return pcm16_frame;
-}
-
-Frame AvPlayerSource::PrepareAudioFrame(GuestBuffer buffer, const AVFrame& frame) {
-    ASSERT(frame.format == AV_SAMPLE_FMT_S16);
-    ASSERT(frame.nb_samples <= 1024);
-
-    auto p_buffer = buffer.GetBuffer();
-    const auto size = frame.ch_layout.nb_channels * frame.nb_samples * sizeof(u16);
-    std::memcpy(p_buffer, frame.data[0], size);
-
-    const auto stream_index = m_streams[m_audio_stream_index.value()].ffmpeg_index;
-    const auto stream = m_avformat_context->streams[stream_index];
-    const auto timestamp = FrameTimestampMillis(frame, stream->time_base);
-
+    auto data = buffer.GetBuffer();
     return Frame{
         .buffer = std::move(buffer),
         .info =
             {
-                .p_data = p_buffer,
+                .p_data = data.data(),
                 .timestamp = timestamp,
                 .details =
                     {
@@ -834,7 +964,7 @@ Frame AvPlayerSource::PrepareAudioFrame(GuestBuffer buffer, const AVFrame& frame
                             {
                                 .channel_count = u16(frame.ch_layout.nb_channels),
                                 .sample_rate = u32(frame.sample_rate),
-                                .size = u32(size),
+                                .size = u32(data.size()),
                             },
                     },
             },
@@ -842,10 +972,9 @@ Frame AvPlayerSource::PrepareAudioFrame(GuestBuffer buffer, const AVFrame& frame
 }
 
 void AvPlayerSource::AudioDecoderThread(std::stop_token stop) {
-    using namespace std::chrono;
     Common::SetCurrentThreadName("shadPS4:AvAudioDecoder");
-
     LOG_INFO(Lib_AvPlayer, "Audio Decoder Thread started");
+
     while ((!m_is_eof || m_audio_packets.Size() != 0) && !stop.stop_requested()) {
         if (m_audio_packets.Size() == 0 &&
             !m_audio_packets_cv.Wait(stop, [this] { return m_audio_packets.Size() != 0; })) {
@@ -855,47 +984,20 @@ void AvPlayerSource::AudioDecoderThread(std::stop_token stop) {
         if (!packet.has_value()) {
             continue;
         }
-        auto res = avcodec_send_packet(m_audio_codec_context.get(), packet->get());
-        if (res < 0 && res != AVERROR(EAGAIN)) {
+        if (!m_audio_buffers_cv.Wait(stop, [this] { return m_audio_buffers.Size() != 0; })) {
+            break;
+        }
+        auto buffer = m_audio_buffers.Pop();
+        const u8* input = (*packet)->data.GetData();
+        const size_t size = (*packet)->data.GetDataSize();
+        auto res = m_audio_decoder->Decode(std::span<const u8>(input, size), buffer->GetBuffer());
+        if (res != ORBIS_OK) {
             m_state.OnError();
-            LOG_ERROR(Lib_AvPlayer, "Could not send packet to the audio codec. Error = {}",
-                      av_err2str(res));
+            LOG_ERROR(Lib_AvPlayer, "Could not decode sample. Error 0x{:X08}", res);
             return;
         }
-        while (res >= 0) {
-            if (m_audio_buffers.Size() == 0 &&
-                !m_audio_buffers_cv.Wait(stop, [this] { return m_audio_buffers.Size() != 0; })) {
-                break;
-            }
-
-            auto up_frame = AVFramePtr(av_frame_alloc(), &ReleaseAVFrame);
-            res = avcodec_receive_frame(m_audio_codec_context.get(), up_frame.get());
-            if (res < 0) {
-                if (res == AVERROR_EOF) {
-                    LOG_INFO(Lib_AvPlayer, "EOF reached in audio decoder");
-                    return;
-                } else if (res != AVERROR(EAGAIN)) {
-                    m_state.OnError();
-                    LOG_ERROR(Lib_AvPlayer,
-                              "Could not receive frame from the audio codec. Error = {}",
-                              av_err2str(res));
-                    return;
-                }
-            } else {
-                auto buffer = m_audio_buffers.Pop();
-                if (!buffer.has_value()) {
-                    // Audio buffers queue was cleared. This means that player was stopped.
-                    break;
-                }
-                if (up_frame->format != AV_SAMPLE_FMT_S16) {
-                    const auto pcm16_frame = ConvertAudioFrame(*up_frame);
-                    m_audio_frames.Push(PrepareAudioFrame(std::move(buffer.value()), *pcm16_frame));
-                } else {
-                    m_audio_frames.Push(PrepareAudioFrame(std::move(buffer.value()), *up_frame));
-                }
-                m_audio_frames_cv.Notify();
-            }
-        }
+        m_audio_frames.Push(PrepareAudioFrame(std::move(buffer.value()), **packet));
+        m_audio_frames_cv.Notify();
     }
 
     LOG_INFO(Lib_AvPlayer, "Audio Decoder Thread exited normally");

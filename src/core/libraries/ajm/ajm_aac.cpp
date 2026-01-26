@@ -46,11 +46,11 @@ AjmAacDecoder::~AjmAacDecoder() {
     }
 }
 
-TRANSPORT_TYPE TransportTypeFromConfigType(ConfigType config_type) {
+TRANSPORT_TYPE TransportTypeFromConfigType(AjmM4AacConfigType config_type) {
     switch (config_type) {
-    case ConfigType::ADTS:
+    case AjmM4AacConfigType::ADTS:
         return TT_MP4_ADTS;
-    case ConfigType::RAW:
+    case AjmM4AacConfigType::RAW:
         return TT_MP4_RAW;
     default:
         UNREACHABLE();
@@ -67,7 +67,7 @@ void AjmAacDecoder::Reset() {
     }
 
     m_decoder = aacDecoder_Open(TransportTypeFromConfigType(m_init_params.config_type), 1);
-    if (m_init_params.config_type == ConfigType::RAW) {
+    if (m_init_params.config_type == AjmM4AacConfigType::RAW) {
         // Manually configure the decoder
         // Things may be incorrect due to limited documentation
         CSAudioSpecificConfig asc{};
@@ -106,7 +106,7 @@ void AjmAacDecoder::Reset() {
 
 void AjmAacDecoder::Initialize(const void* buffer, u32 buffer_size) {
     ASSERT(buffer_size == 8);
-    m_init_params = *reinterpret_cast<const InitializeParameters*>(buffer);
+    m_init_params = *reinterpret_cast<const AjmSidebandDecM4AacInitParams*>(buffer);
     Reset();
 }
 

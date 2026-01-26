@@ -14,7 +14,7 @@ struct AAC_DECODER_INSTANCE;
 
 namespace Libraries::Ajm {
 
-enum ConfigType : u32 {
+enum AjmM4AacConfigType : u32 {
     ADTS = 1,
     RAW = 2,
 };
@@ -26,6 +26,11 @@ enum AjmAacCodecFlags : u32 {
     SurroundChannelInterleaveOrderLsRsExtlExtr = 1 << 3,
 };
 DECLARE_ENUM_FLAG_OPERATORS(AjmAacCodecFlags)
+
+struct AjmSidebandDecM4AacInitParams {
+    AjmM4AacConfigType config_type;
+    u32 sampling_freq_type;
+};
 
 struct AjmSidebandDecM4aacCodecInfo {
     u32 heaac;
@@ -46,11 +51,6 @@ struct AjmAacDecoder final : AjmCodec {
                               AjmInstanceGapless& gapless) override;
 
 private:
-    struct InitializeParameters {
-        ConfigType config_type;
-        u32 sampling_freq_type;
-    };
-
     template <class T>
     size_t WriteOutputSamples(SparseOutputBuffer& output, std::span<const s16> pcm);
     std::span<const s16> GetOuputPcm(u32 skipped_pcm, u32 max_pcm) const;
@@ -62,7 +62,7 @@ private:
     std::vector<float> m_resample_buffer;
 
     u32 m_skip_frames = 0;
-    InitializeParameters m_init_params = {};
+    AjmSidebandDecM4AacInitParams m_init_params = {};
     AAC_DECODER_INSTANCE* m_decoder = nullptr;
 };
 
