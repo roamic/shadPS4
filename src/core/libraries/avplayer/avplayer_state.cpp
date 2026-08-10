@@ -173,9 +173,8 @@ bool AvPlayerState::GetStreamInfo(u32 stream_index, AvPlayerStreamInfo& info) {
 
 // Called inside GAME thread
 bool AvPlayerState::Start() {
-    std::unique_lock lock(m_source_mutex);
+    std::shared_lock lock(m_source_mutex);
     if (m_current_state == AvState::Ready || m_current_state == AvState::Stop || Stop()) {
-        m_eof_stop_event_sent = false;
         SetState(AvState::Starting);
         if (!m_up_source->Start()) {
             LOG_ERROR(Lib_AvPlayer, "Could not start playback.");
@@ -204,9 +203,7 @@ bool AvPlayerState::Pause() {
         return false;
     }
     m_up_source->Pause();
-    if (!SetState(AvState::Pause)) {
-        return false;
-    }
+    SetState(AvState::Pause);
     OnPlaybackStateChanged(AvState::Pause);
     return true;
 }
@@ -287,7 +284,6 @@ bool AvPlayerState::Stop() {
     if (!SetState(AvState::Stop)) {
         return false;
     }
-    m_eof_stop_event_sent = true;
     OnPlaybackStateChanged(AvState::Stop);
     return true;
 }
@@ -361,16 +357,6 @@ void AvPlayerState::OnError() {
 
 void AvPlayerState::OnEOF() {
     SetState(AvState::EndOfFile);
-}
-
-void AvPlayerState::UpdateEndOfFileState() {
-    std::shared_lock lock(m_source_mutex);
-    if (m_up_source == nullptr || m_up_source->IsActive() || m_eof_stop_event_sent.exchange(true)) {
-        return;
-    }
-    lock.unlock();
-
-    EmitEvent(AvPlayerEvents::StateStop);
 }
 
 // Called inside CONTROLLER thread
@@ -456,18 +442,8 @@ void AvPlayerState::ProcessEvent() {
         break;
     }
     case AvEventType::AddSource: {
-        bool found = false;
-        {
-            std::unique_lock lock(m_source_mutex);
-            found = m_up_source != nullptr && m_up_source->FindStreams();
-        }
-        if (found) {
-            SetState(AvState::Ready);
-            OnPlaybackStateChanged(AvState::Ready);
-        } else {
-            OnWarning(ORBIS_AVPLAYER_ERROR_NOT_SUPPORTED);
-            SetState(AvState::Error);
-        }
+        SetState(AvState::Ready);
+        OnPlaybackStateChanged(AvState::Ready);
         break;
     }
     case AvEventType::Error: {
@@ -482,9 +458,7 @@ void AvPlayerState::ProcessEvent() {
 
 // Called inside CONTROLLER thread
 void AvPlayerState::UpdateBufferingState() {
-    if (m_current_state == AvState::EndOfFile) {
-        UpdateEndOfFileState();
-    } else if (m_current_state == AvState::Buffering) {
+    if (m_current_state == AvState::Buffering) {
         const auto has_frames = OnBufferingCheckEvent(10);
         if (!has_frames.has_value()) {
             return;

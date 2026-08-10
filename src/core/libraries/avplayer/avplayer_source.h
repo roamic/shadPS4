@@ -16,8 +16,8 @@
 
 #include "common/assert.h"
 #include "core/libraries/avplayer/avplayer.h"
+#include "core/libraries/avplayer/avplayer_ajm_wrapper.h"
 #include "core/libraries/avplayer/avplayer_common.h"
-#include "core/libraries/avplayer/avplayer_data_streamer.h"
 #include "core/libraries/kernel/threads.h"
 
 struct AVCodecContext;
@@ -78,6 +78,7 @@ public:
 
     GuestBuffer& operator=(GuestBuffer&& r) noexcept {
         std::swap(m_data, r.m_data);
+        std::swap(m_is_texture, r.m_is_texture);
         return *this;
     }
 
@@ -87,22 +88,28 @@ public:
 
 private:
     static u8* Allocate(const AvPlayerMemAllocator& memory_replacement, u32 align, u32 size) {
-        return reinterpret_cast<u8*>(
-            memory_replacement.allocate(memory_replacement.object_ptr, align, size));
+        const auto allocate = memory_replacement.allocate;
+        const auto obj = memory_replacement.object_ptr;
+        return reinterpret_cast<u8*>(allocate(obj, align, size));
     }
 
     static void Deallocate(const AvPlayerMemAllocator& memory_replacement, void* ptr) {
-        memory_replacement.deallocate(memory_replacement.object_ptr, ptr);
+        const auto deallocate = memory_replacement.deallocate;
+        const auto obj = memory_replacement.object_ptr;
+        deallocate(obj, ptr);
     }
 
     static u8* AllocateTexture(const AvPlayerMemAllocator& memory_replacement, u32 align,
                                u32 size) {
-        return reinterpret_cast<u8*>(
-            memory_replacement.allocate_texture(memory_replacement.object_ptr, align, size));
+        const auto allocate = memory_replacement.allocate_texture;
+        const auto obj = memory_replacement.object_ptr;
+        return reinterpret_cast<u8*>(allocate(obj, align, size));
     }
 
     static void DeallocateTexture(const AvPlayerMemAllocator& memory_replacement, void* ptr) {
-        memory_replacement.deallocate_texture(memory_replacement.object_ptr, ptr);
+        const auto deallocate_texture = memory_replacement.deallocate_texture;
+        const auto obj = memory_replacement.object_ptr;
+        deallocate_texture(obj, ptr);
     }
 
     const AvPlayerMemAllocator& m_memory_replacement;
@@ -113,6 +120,7 @@ private:
 struct Frame {
     GuestBuffer buffer;
     AvPlayerFrameInfoEx info;
+    bool is_last = false;
 };
 
 class EventCV {
@@ -169,7 +177,7 @@ public:
 
 private:
     u64 DurationMillis() const;
-    AvPlayerStreamInfo CreateStreamInfo(u32 stream_index);
+    AvPlayerStreamInfo CreateStreamInfo(size_t idx, AP4_Track* p_track);
 
     static void ReleaseAVPacket(AVPacket* packet);
     static void ReleaseAVFrame(AVFrame* frame);
@@ -187,17 +195,15 @@ private:
     void VideoDecoderThread(std::stop_token stop);
     void AudioDecoderThread(std::stop_token stop);
 
-    bool HasRunningThreads() const;
-
     AVFramePtr ConvertVideoFrame(const AVFrame& frame);
 
-    Frame PrepareAudioFrame(GuestBuffer buffer, const AP4_Packet& packet);
-    Frame PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame);
+    void PrepareAudioFrame(Frame& frame, const AP4_Packet& packet);
+    void PrepareVideoFrame(Frame& frame, const AVFrame& av_frame);
 
     AvPlayerStateCallback& m_state;
 
     struct Stream {
-        size_t ffmpeg_index = 0;
+        size_t mp4_index = 0;
         AvPlayerStreamInfo info;
     };
 
@@ -214,17 +220,14 @@ private:
     std::unique_ptr<AP4_ByteStream> m_up_data_streamer;
     std::unique_ptr<AP4_File> m_ap4_file;
 
-    AvPlayerQueue<GuestBuffer> m_audio_buffers;
-    AvPlayerQueue<GuestBuffer> m_video_buffers;
+    AvPlayerQueue<Frame> m_audio_buffers;
+    AvPlayerQueue<Frame> m_video_buffers;
 
     AvPlayerQueue<std::unique_ptr<AP4_Packet>> m_audio_packets;
     AvPlayerQueue<std::unique_ptr<AP4_Packet>> m_video_packets;
 
     AvPlayerQueue<Frame> m_audio_frames;
     AvPlayerQueue<Frame> m_video_frames;
-
-    std::optional<Frame> m_current_video_frame;
-    std::optional<Frame> m_current_audio_frame;
 
     u32 m_video_track_index;
     u32 m_audio_track_index;
@@ -249,6 +252,7 @@ private:
     AVCodecContextPtr m_video_codec_context{nullptr, &ReleaseAVCodecContext};
     SWSContextPtr m_sws_context{nullptr, &ReleaseSWSContext};
 
+    u32 m_ajm_context_id;
     std::unique_ptr<AjmAacDecoder> m_audio_decoder;
 
     std::optional<u64> m_last_audio_ts{};
